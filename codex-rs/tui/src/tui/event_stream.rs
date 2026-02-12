@@ -142,6 +142,7 @@ pub struct TuiEventStream<S: EventSource + Default + Unpin = CrosstermEventSourc
     resume_stream: WatchStream<()>,
     terminal_focused: Arc<AtomicBool>,
     poll_draw_first: bool,
+    consecutive_input_errors: u8,
     #[cfg(unix)]
     suspend_context: crate::tui::job_control::SuspendContext,
     #[cfg(unix)]
@@ -163,6 +164,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             resume_stream,
             terminal_focused,
             poll_draw_first: false,
+            consecutive_input_errors: 0,
             #[cfg(unix)]
             suspend_context,
             #[cfg(unix)]
@@ -176,6 +178,16 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
     /// a mapped event, hits `Pending`, or sees EOF/error. When the broker is paused, it drops
     /// the underlying stream and returns `Pending` to fully release stdin.
     pub fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
+        enum PollOutcome {
+            Event(Event),
+            Pending,
+            End,
+            InputError,
+            Restart,
+        }
+
+        let mut restarted_once = false;
+
         // Some crossterm events map to None (e.g. FocusLost, mouse); loop so we keep polling
         // until we return a mapped event, hit Pending, or see EOF/error.
         loop {
@@ -185,38 +197,72 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let events = match state.active_event_source_mut() {
-                    Some(events) => events,
-                    None => {
-                        drop(state);
-                        // Poll resume_stream so resume_events wakes a stream paused here
-                        match Pin::new(&mut self.resume_stream).poll_next(cx) {
-                            Poll::Ready(Some(())) => continue,
-                            Poll::Ready(None) => return Poll::Ready(None),
-                            Poll::Pending => return Poll::Pending,
+                if let Some(events) = state.active_event_source_mut() {
+                    match Pin::new(events).poll_next(cx) {
+                        Poll::Ready(Some(Ok(event))) => PollOutcome::Event(event),
+                        Poll::Ready(Some(Err(_))) => PollOutcome::InputError,
+                        Poll::Ready(None) => {
+                            *state = EventBrokerState::Start;
+                            PollOutcome::Restart
+                        }
+                        Poll::Pending => {
+                            drop(state);
+                            // Poll resume_stream so resume_events can wake us even while waiting on stdin
+                            match Pin::new(&mut self.resume_stream).poll_next(cx) {
+                                Poll::Ready(Some(())) => PollOutcome::Restart,
+                                Poll::Ready(None) => PollOutcome::End,
+                                Poll::Pending => PollOutcome::Pending,
+                            }
                         }
                     }
-                };
-                match Pin::new(events).poll_next(cx) {
-                    Poll::Ready(Some(Ok(event))) => Some(event),
-                    Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                        *state = EventBrokerState::Start;
-                        return Poll::Ready(None);
-                    }
-                    Poll::Pending => {
-                        drop(state);
-                        // Poll resume_stream so resume_events can wake us even while waiting on stdin
-                        match Pin::new(&mut self.resume_stream).poll_next(cx) {
-                            Poll::Ready(Some(())) => continue,
-                            Poll::Ready(None) => return Poll::Ready(None),
-                            Poll::Pending => return Poll::Pending,
-                        }
+                } else {
+                    drop(state);
+                    // Poll resume_stream so resume_events wakes a stream paused here
+                    match Pin::new(&mut self.resume_stream).poll_next(cx) {
+                        Poll::Ready(Some(())) => PollOutcome::Restart,
+                        Poll::Ready(None) => PollOutcome::End,
+                        Poll::Pending => PollOutcome::Pending,
                     }
                 }
             };
 
-            if let Some(mapped) = poll_result.and_then(|event| self.map_crossterm_event(event)) {
-                return Poll::Ready(Some(mapped));
+            match poll_result {
+                PollOutcome::Event(event) => {
+                    self.consecutive_input_errors = 0;
+                    if let Some(mapped) = self.map_crossterm_event(event) {
+                        return Poll::Ready(Some(mapped));
+                    }
+                }
+                PollOutcome::Pending => return Poll::Pending,
+                PollOutcome::End => return Poll::Ready(None),
+                PollOutcome::InputError => {
+                    // Some terminals can emit transient read errors while keeping the stream
+                    // otherwise healthy. Skip the first error to preserve any already-buffered
+                    // events; if errors repeat back-to-back, recreate the source.
+                    self.consecutive_input_errors = self.consecutive_input_errors.saturating_add(1);
+                    if self.consecutive_input_errors == 1 {
+                        continue;
+                    }
+                    let mut state = self
+                        .broker
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *state = EventBrokerState::Start;
+                    drop(state);
+                    self.consecutive_input_errors = 0;
+                }
+                PollOutcome::Restart => {
+                    self.consecutive_input_errors = 0;
+                    // Transient stdin read errors (for example EIO over SSH) should not permanently
+                    // terminate the stream. Retry once immediately to recreate the source and
+                    // re-register a waker; after that, yield and try again on the next poll.
+                    if restarted_once {
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    restarted_once = true;
+                }
             }
         }
     }
@@ -452,14 +498,119 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn error_or_eof_ends_stream() {
+    async fn error_restarts_stream_and_yields_next_event() {
         let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
         let mut stream = make_stream(broker, draw_rx, terminal_focused);
 
         handle.send(Err(std::io::Error::other("boom")));
+        let expected_key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+        handle.send(Ok(Event::Key(expected_key)));
 
         let next = stream.next().await;
-        assert!(next.is_none());
+        match next {
+            Some(TuiEvent::Key(key)) => assert_eq!(key, expected_key),
+            other => panic!("expected key event after restart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_consecutive_errors_continue_without_dropping_events() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+
+        let first_key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let second_key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+
+        handle.send(Err(std::io::Error::other("first transient error")));
+        handle.send(Ok(Event::Key(first_key)));
+        handle.send(Err(std::io::Error::other("second transient error")));
+        handle.send(Ok(Event::Key(second_key)));
+
+        let first = stream.next().await;
+        let second = stream.next().await;
+
+        match first {
+            Some(TuiEvent::Key(key)) => assert_eq!(key, first_key),
+            other => panic!("expected first key event, got {other:?}"),
+        }
+        match second {
+            Some(TuiEvent::Key(key)) => assert_eq!(key, second_key),
+            other => panic!("expected second key event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consecutive_errors_recreate_source_and_recover() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+
+        handle.send(Err(std::io::Error::other("first transient error")));
+        handle.send(Err(std::io::Error::other("second transient error")));
+
+        let task = tokio::spawn(async move { stream.next().await });
+        tokio::task::yield_now().await;
+
+        let expected_key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        handle.send(Ok(Event::Key(expected_key)));
+
+        let event = timeout(Duration::from_millis(100), task)
+            .await
+            .expect("timed out waiting for event after restart")
+            .expect("join failed");
+        match event {
+            Some(TuiEvent::Key(key)) => assert_eq!(key, expected_key),
+            other => panic!("expected key event after consecutive errors, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn errors_separated_by_pending_recreate_source() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker.clone(), draw_rx, terminal_focused);
+
+        let stale_sender = {
+            let mut state = broker
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(source) = state.active_event_source_mut() else {
+                panic!("expected active source");
+            };
+            source.tx.clone()
+        };
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        handle.send(Err(std::io::Error::other("first transient error")));
+        assert!(matches!(
+            stream.poll_crossterm_event(&mut cx),
+            Poll::Pending
+        ));
+
+        handle.send(Err(std::io::Error::other("second transient error")));
+        assert!(matches!(
+            stream.poll_crossterm_event(&mut cx),
+            Poll::Pending
+        ));
+
+        let stale_send_result = stale_sender.send(Ok(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        ))));
+        assert!(
+            stale_send_result.is_err(),
+            "expected old source sender to fail after restart"
+        );
+
+        let expected_key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        handle.send(Ok(Event::Key(expected_key)));
+
+        let next = stream.next().await;
+        match next {
+            Some(TuiEvent::Key(key)) => assert_eq!(key, expected_key),
+            other => panic!("expected key event after pending-separated restart, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

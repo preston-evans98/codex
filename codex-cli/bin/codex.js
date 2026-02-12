@@ -12,6 +12,24 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
 
+function isIgnorableStdinError(err) {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    err.code === "EIO"
+  );
+}
+
+// SSH/PTY teardown can emit EIO on stdin while exiting; keep this from
+// surfacing as an unhandled Node socket error.
+process.stdin.on("error", (err) => {
+  if (isIgnorableStdinError(err)) {
+    return;
+  }
+  throw err;
+});
+
 const PLATFORM_PACKAGE_BY_TARGET = {
   "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
   "aarch64-unknown-linux-musl": "@openai/codex-linux-arm64",

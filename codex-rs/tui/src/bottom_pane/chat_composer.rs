@@ -2058,7 +2058,7 @@ impl ChatComposer {
                         original_mention_bindings,
                     );
                     self.pending_pastes.clone_from(&original_pending_pastes);
-                    self.textarea.set_cursor(original_input.len());
+                    self.move_cursor_to_end();
                     return None;
                 }
             }
@@ -2079,7 +2079,7 @@ impl ChatComposer {
                             original_mention_bindings,
                         );
                         self.pending_pastes.clone_from(&original_pending_pastes);
-                        self.textarea.set_cursor(original_input.len());
+                        self.move_cursor_to_end();
                         return None;
                     }
                 };
@@ -2208,6 +2208,7 @@ impl ChatComposer {
                 original_mention_bindings,
             );
             self.pending_pastes = original_pending_pastes;
+            self.move_cursor_to_end();
             (InputResult::None, true)
         }
     }
@@ -5289,6 +5290,54 @@ mod tests {
             }
         }
         assert!(found_error, "expected error history cell to be sent");
+    }
+
+    #[test]
+    fn unrecognized_slash_command_keeps_cursor_at_end() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        type_chars_humanlike(&mut composer, &['/', 'h', 'e', 'l', 'p']);
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(InputResult::None, result);
+        assert_eq!("/help", composer.textarea.text());
+        assert_eq!("/help".len(), composer.textarea.cursor());
+
+        type_chars_humanlike(&mut composer, &['/', 'a', 'b', 'c']);
+
+        assert_eq!("/help/abc", composer.textarea.text());
+        assert_eq!("/help/abc".len(), composer.textarea.cursor());
+
+        let mut found_error = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                let message = cell
+                    .display_lines(80)
+                    .into_iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if message.contains("Unrecognized command '/help'") {
+                    found_error = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_error, "expected unrecognized-command history cell");
     }
 
     #[test]
